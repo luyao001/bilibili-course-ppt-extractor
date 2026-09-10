@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+bili_ppt_work/
+课件输出/
+cookies*.txt
+*.mp4
+audit_report.json
+.DS_Store
+test_work/
+test_out/
