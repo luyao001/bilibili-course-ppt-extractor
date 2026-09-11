@@ -10,7 +10,7 @@
    - vanish 指标：前帧内容像素在后帧中消失的比例（排除模板区域与讲师列带）
 5. img2pdf 按时间序合成 PDF，归档到 章节/ 文件夹
 """
-import cv2, numpy as np, os, sys, json, glob, re, subprocess, shutil, time, difflib
+import cv2, numpy as np, os, sys, json, glob, re, subprocess, shutil, time, difflib, tempfile
 
 try:
     import imageio_ffmpeg
@@ -39,25 +39,44 @@ def get_duration(video):
     n = cap.get(cv2.CAP_PROP_FRAME_COUNT)
     fps = cap.get(cv2.CAP_PROP_FPS)
     cap.release()
-    return (n / fps) if fps and n else 0.0
+    return (n / fps) if np.isfinite(n) and np.isfinite(fps) and fps > 0 and n > 0 else 0.0
 
 
 def extract_frames(video, fdir, sample_fps=SAMPLE_FPS):
     """ffmpeg 抽取分析用小帧；已有帧缓存则复用"""
+    if not np.isfinite(sample_fps) or sample_fps <= 0:
+        raise ValueError('sample_fps must be positive')
+    stat = os.stat(video)
+    signature = {'source': os.path.abspath(video), 'size': stat.st_size,
+                 'mtime_ns': stat.st_mtime_ns, 'fps': sample_fps, 'version': 2}
+    marker = os.path.join(fdir, 'complete.json')
     old = sorted(glob.glob(os.path.join(fdir, '*.jpg')))
-    if len(old) > 50:
-        return old
-    if os.path.isdir(fdir):
-        shutil.rmtree(fdir)
+    try:
+        with open(marker, encoding='utf-8') as f:
+            cached = json.load(f)
+        if cached['signature'] == signature and cached['count'] == len(old) and old:
+            return old
+    except (OSError, ValueError, KeyError, TypeError):
+        pass
     os.makedirs(fdir, exist_ok=True)
+    # Only remove files owned by this frame cache.
+    for path in old + ([marker] if os.path.exists(marker) else []):
+        os.remove(path)
     cmd = [FFMPEG, '-y', '-v', 'error', '-i', video,
-           '-vf', f'fps={sample_fps},scale=160:90', '-q:v', '7',
+           '-vf', f'fps={sample_fps},scale=160:90', '-q:v', '3',
            os.path.join(fdir, '%06d.jpg')]
-    subprocess.run(cmd, capture_output=True, text=True)
-    return sorted(glob.glob(os.path.join(fdir, '*.jpg')))
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode:
+        raise RuntimeError(f'抽帧失败: {result.stderr[-2000:]}')
+    frames = sorted(glob.glob(os.path.join(fdir, '*.jpg')))
+    if not frames:
+        raise RuntimeError('视频未产生分析帧')
+    with open(marker, 'w', encoding='utf-8') as f:
+        json.dump({'signature': signature, 'count': len(frames)}, f)
+    return frames
 
 
-def segment(frames, thr=1.6):
+def segment(frames, thr=1.6, sample_fps=SAMPLE_FPS, min_run_s=0.5, conservative=True):
     """块级翻页切分。
     - 时间方差掩码剔除持续变化区域（讲师人像/全局噪声过高时自动退化为不掩码）
     - 切点条件：静态掩码块中最大的两块均值差均>8，或单块>15
@@ -67,10 +86,16 @@ def segment(frames, thr=1.6):
     ims = []
     for f in frames:
         im = cv2.imread(f, cv2.IMREAD_GRAYSCALE)
-        ims.append(None if im is None else cv2.resize(im, (64, 36)).astype(np.float32))
+        if im is None:
+            raise RuntimeError(f'分析帧损坏: {f}')
+        ims.append(cv2.resize(im, (64, 36)).astype(np.float32))
     ims = [x for x in ims if x is not None]
     n = len(ims)
-    dt = 1.0 / SAMPLE_FPS
+    if not frames:
+        raise ValueError('没有分析帧')
+    if not np.isfinite(sample_fps) or not np.isfinite(min_run_s) or sample_fps <= 0 or min_run_s < 0:
+        raise ValueError('无效采样参数')
+    dt = 1.0 / sample_fps
     if n >= 10:
         stack = np.stack(ims)
         std_map = stack.std(axis=0)
@@ -86,11 +111,13 @@ def segment(frames, thr=1.6):
         static_mask = np.ones((36, 64), np.float32)
         template64 = np.zeros((36, 64), np.float32)
 
+    if conservative:
+        static_mask = np.ones_like(static_mask)
     sm_blk = static_mask.reshape(4, 9, 8, 8)
-    blk_static = (sm_blk.mean(axis=(2, 3)) > 0.6)
+    blk_static = (sm_blk.mean(axis=(1, 3)) > 0.6)
 
     def is_cut(a, b):
-        bd = np.abs(a - b).reshape(4, 9, 8, 8).mean(axis=(2, 3))
+        bd = np.abs(a - b).reshape(4, 9, 8, 8).mean(axis=(1, 3))
         cand = bd[blk_static] if blk_static.any() else bd.flat
         top2 = np.sort(cand.flat)[-2:]
         return bool((top2 > 8).all() or cand.max() > 15)
@@ -100,7 +127,7 @@ def segment(frames, thr=1.6):
         if is_cut(ims[k], ims[k + 1]):
             segs.append([start, k]); start = k + 1
     segs.append([start, n - 1])
-    segs = [[s, e] for s, e in segs if (e - s) * dt >= MIN_RUN_S]
+    segs = [[s, e] for s, e in segs if (e - s + 1) * dt >= min_run_s]
 
     mids = []
     for s, e in segs:
@@ -112,7 +139,7 @@ def segment(frames, thr=1.6):
         return [], static_mask, template64
     merged = [mids[0]]
     for m in mids[1:]:
-        if float(np.mean(np.abs(merged[-1][2] - m[2]))) < MERGE_THR:
+        if not conservative and float(np.mean(np.abs(merged[-1][2] - m[2]))) < MERGE_THR:
             continue
         merged.append(m)
     return [(t, mi) for mi, t, _ in merged], static_mask, template64
@@ -142,128 +169,179 @@ def get_face():
     return _FACE
 
 
-def extract_pages(video, work_dir, pnum=1, ocr=None, pages_dir=None):
+def extract_pages(video, work_dir, pnum=1, ocr=None, pages_dir=None,
+                  mode='conservative', sample_fps=SAMPLE_FPS, min_run_s=0.5):
     """主流程：返回 metas（页面元信息列表）并把页面PNG写入 pages_dir"""
     import img2pdf
     cv2.setNumThreads(4)
     if ocr is None:
-        from rapidocr_onnxruntime import RapidOCR
-        ocr = RapidOCR()
+        if mode == 'compact':
+            from rapidocr_onnxruntime import RapidOCR
+            ocr = RapidOCR()
+        else:
+            ocr = lambda image: (None, None)
+    pages_dir = pages_dir or os.path.join(work_dir, 'pages', f'{pnum:03d}')
     os.makedirs(pages_dir, exist_ok=True)
 
     dur = get_duration(video)
-    frames = extract_frames(video, os.path.join(work_dir, 'frames', f'{pnum:03d}'))
+    frames = extract_frames(video, os.path.join(work_dir, 'frames', f'{pnum:03d}'), sample_fps=sample_fps)
     log(work_dir, pnum, f'时长{dur:.0f}s 分析帧{len(frames)}')
-    segs, static_mask, template64 = segment(frames)
+    segs, static_mask, template64 = segment(frames, sample_fps=sample_fps, min_run_s=min_run_s, conservative=mode == 'conservative')
     log(work_dir, pnum, f'分段数 {len(segs)} 静态区{static_mask.mean():.0%} 模板区{template64.mean():.0%}')
 
-    cap = cv2.VideoCapture(video)
-    cands = []
-    for t, fi in segs:
-        cap.set(cv2.CAP_PROP_POS_MSEC, t * 1000)
-        ok, img = cap.read()
-        if not ok:
-            continue
-        h, w = img.shape[:2]
-        topband = cv2.cvtColor(img[int(h*0.02):int(h*0.10), int(w*0.05):int(w*0.95)],
-                               cv2.COLOR_BGR2GRAY)
-        top_white = (float(topband.mean()) > 250 and float(topband.std()) < 8)
-        title = ocr_text(ocr, img, 0.05, 0.95, 0.03, 0.32)
-        mid = ocr_text(ocr, img, 0.0, 1.0, 0.15, 0.75, scale=1.2)
-        full = mid if len(mid) >= 10 else ocr_text(ocr, img, 0.0, 1.0, 0.0, 1.0, scale=1.2)
-        g = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        faces = get_face().detectMultiScale(g, scaleFactor=1.1, minNeighbors=5, minSize=(36, 36))
-        fx = faces[:, [0, 2]] * (128.0 / img.shape[1]) if len(faces) else None
-        cands.append({'t': t, 'img': img, 'title': title, 'mid_len': len(mid),
-                      'full_len': len(full), 'top_white': top_white,
-                      'edge': edge_density(img),
-                      'darkish': float((g < DARK_THR).mean()),
-                      'face_x': (int(fx[:, 0].min()), int((fx[:, 0] + fx[:, 1]).max()))
-                                if fx is not None else None,
-                      'gray': cv2.resize(g, (128, 72)).astype(np.float32)})
-    cap.release()
+    with tempfile.TemporaryDirectory(prefix='.candidates-', dir=pages_dir) as candidate_dir:
+        cap = cv2.VideoCapture(video)
+        cands = []
+        for t, fi in segs:
+            cap.set(cv2.CAP_PROP_POS_MSEC, t * 1000)
+            ok, img = cap.read()
+            if not ok:
+                cap.release()
+                raise RuntimeError(f'原始视频帧读取失败: {t:.2f}s')
+            h, w = img.shape[:2]
+            topband = cv2.cvtColor(img[int(h*0.02):int(h*0.10), int(w*0.05):int(w*0.95)],
+                                   cv2.COLOR_BGR2GRAY)
+            top_white = (float(topband.mean()) > 250 and float(topband.std()) < 8)
+            title = ocr_text(ocr, img, 0.05, 0.95, 0.03, 0.32)
+            mid = ocr_text(ocr, img, 0.0, 1.0, 0.15, 0.75, scale=1.2)
+            full = mid if len(mid) >= 10 else ocr_text(ocr, img, 0.0, 1.0, 0.0, 1.0, scale=1.2)
+            g = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+            faces = get_face().detectMultiScale(g, scaleFactor=1.1, minNeighbors=5, minSize=(36, 36))
+            fx = faces[:, [0, 2]] * (128.0 / img.shape[1]) if len(faces) else None
+            candidate_path = os.path.join(candidate_dir, f'{fi:06d}.png')
+            if not cv2.imwrite(candidate_path, img):
+                cap.release()
+                raise RuntimeError('候选图片写入失败')
+            cands.append({'t': t, 'image_path': candidate_path, 'title': title, 'mid_len': len(mid),
+                          'full_len': len(full), 'top_white': top_white,
+                          'edge': edge_density(img),
+                          'darkish': float((g < DARK_THR).mean()),
+                          'face_x': (int(fx[:, 0].min()), int((fx[:, 0] + fx[:, 1]).max()))
+                                    if fx is not None else None,
+                          'gray': cv2.resize(g, (128, 72)).astype(np.float32)})
+        cap.release()
 
-    # 内容页筛选：剔除片头白屏页、深色转场页、无正文文字的讲师独占页
-    content = [c for c in cands
-               if not c['top_white'] and c['darkish'] < 0.35
-               and (c['mid_len'] >= 10 or c['full_len'] >= 25)]
-    if not content:
-        content = cands
-        log(work_dir, pnum, '警告: 内容页判据全失败，保留全部候选')
+        # 内容页筛选：剔除片头白屏页、深色转场页、无正文文字的讲师独占页
+        content = [c for c in cands
+                   if not c['top_white'] and c['darkish'] < 0.35
+                   and (c['mid_len'] >= 10 or c['full_len'] >= 25)]
+        if mode == 'conservative':
+            # Brightness and OCR failures are not evidence that a slide is disposable.
+            content = cands
+        if not content:
+            content = cands
+            log(work_dir, pnum, '警告: 内容页判据全失败，保留全部候选')
 
-    # 讲师列带排除：人脸框中位数中心定位讲师常驻列，不参与内容消失判定
-    sm = cv2.resize(static_mask, (128, 72), interpolation=cv2.INTER_NEAREST).astype(bool)
-    template128 = cv2.resize(template64, (128, 72), interpolation=cv2.INTER_NEAREST).astype(bool)
-    sm &= ~template128
-    centers = [(box[0] + box[1]) / 2 for box in
-               (c['face_x'] for c in content if c.get('face_x'))]
-    if len(centers) >= 3:
-        import statistics
-        cc = int(statistics.median(centers))
-        cx0, cx1 = max(0, cc - 45), min(128, cc + 45)
-        if cx1 - cx0 < 128 * 0.6:
-            sm[:, cx0:cx1] = False
-            log(work_dir, pnum, f'讲师列带排除 {cx0}-{cx1}')
+        # 讲师列带排除：人脸框中位数中心定位讲师常驻列，不参与内容消失判定
+        sm = cv2.resize(static_mask, (128, 72), interpolation=cv2.INTER_NEAREST).astype(bool)
+        template128 = cv2.resize(template64, (128, 72), interpolation=cv2.INTER_NEAREST).astype(bool)
+        sm &= ~template128
+        centers = [(box[0] + box[1]) / 2 for box in
+                   (c['face_x'] for c in content if c.get('face_x'))]
+        if len(centers) >= 3:
+            import statistics
+            cc = int(statistics.median(centers))
+            cx0, cx1 = max(0, cc - 45), min(128, cc + 45)
+            if cx1 - cx0 < 128 * 0.6:
+                sm[:, cx0:cx1] = False
+                log(work_dir, pnum, f'讲师列带排除 {cx0}-{cx1}')
 
-    def vanish(a, b):
-        darkA = (a['gray'] < DARK_THR) & sm
-        darkB = (b['gray'] < DARK_THR) & sm
-        return float((darkA & ~darkB).sum()) / max(int(darkA.sum()), 1)
+        def vanish(a, b):
+            darkA = (a['gray'] < DARK_THR) & sm
+            darkB = (b['gray'] < DARK_THR) & sm
+            return float((darkA & ~darkB).sum()) / max(int(darkA.sum()), 1)
 
-    def layout_sim(a, b):
-        ba = (a['gray'] < DARK_THR).reshape(4, 18, 8, 16).mean(axis=(2, 3)) > 0.04
-        bb = (b['gray'] < DARK_THR).reshape(4, 18, 8, 16).mean(axis=(2, 3)) > 0.04
-        return float((ba == bb).mean())
+        def layout_sim(a, b):
+            ba = (a['gray'] < DARK_THR).reshape(4, 18, 8, 16).mean(axis=(1, 3)) > 0.04
+            bb = (b['gray'] < DARK_THR).reshape(4, 18, 8, 16).mean(axis=(1, 3)) > 0.04
+            return float((ba == bb).mean())
 
-    # 组内峰值保留：vanish低+版面相似 => 同页递进序列，保留信息最全一帧
-    groups = []
-    for c in content:
-        if groups:
-            last = groups[-1]['items'][-1]
-            if vanish(last, c) < VANISH_THR and layout_sim(last, c) > LAYOUT_SIM:
-                groups[-1]['items'].append(c)
-                continue
-        groups.append({'items': [c]})
-    kept = [max(g['items'], key=lambda x: x['edge']) for g in groups]
-    log(work_dir, pnum, f'候选{len(cands)} -> 内容页{len(content)} -> 页面{len(kept)}')
+        # 组内峰值保留：vanish低+版面相似 => 同页递进序列，保留信息最全一帧
+        groups = []
+        for c in content:
+            if groups:
+                last = groups[-1]['items'][-1]
+                if mode == 'compact' and sm.mean() > 0.1 and vanish(last, c) < VANISH_THR and layout_sim(last, c) > LAYOUT_SIM:
+                    groups[-1]['items'].append(c)
+                    continue
+            groups.append({'items': [c]})
+        kept = [max(g['items'], key=lambda x: x['edge']) for g in groups]
+        log(work_dir, pnum, f'候选{len(cands)} -> 内容页{len(content)} -> 页面{len(kept)}')
 
-    metas, bad = [], 0
-    for i, c in enumerate(kept, 1):
-        h, w = c['img'].shape[:2]
-        gstd = float(cv2.cvtColor(c['img'], cv2.COLOR_BGR2GRAY).std())
-        healthy = (w >= 800 and gstd > 9)
-        if not healthy:
-            bad += 1
-        cv2.imwrite(os.path.join(pages_dir, f'{i:03d}.png'), c['img'])
-        metas.append({'idx': i, 't': round(c['t'], 1), 'title': c['title'][:40],
-                      'gray_std': round(gstd, 1), 'healthy': bool(healthy)})
-    return metas, bad
+        metas, bad = [], 0
+        for i, c in enumerate(kept, 1):
+            img = cv2.imread(c['image_path'])
+            if img is None:
+                raise RuntimeError('候选图片读取失败')
+            h, w = img.shape[:2]
+            gstd = float(cv2.cvtColor(img, cv2.COLOR_BGR2GRAY).std())
+            healthy = (w >= 800 and gstd > 9)
+            if not healthy:
+                bad += 1
+            if not cv2.imwrite(os.path.join(pages_dir, f'{i:03d}.png'), img):
+                raise RuntimeError('页面图片写入失败')
+            metas.append({'idx': i, 't': round(c['t'], 1), 'title': c['title'][:40],
+                          'gray_std': round(gstd, 1), 'healthy': bool(healthy)})
+        return metas, bad
 
 
 def build_pdf(pnum, part, pages_dir, out_dir, work_dir, ocr=None):
     """将页面PNG合成PDF并按章节归档，返回 (pdf_path, n_pages)"""
     import img2pdf
-    chap = part.split('.')[0] if re.match(r'^\d+', part) else '未分类'
+    match = re.match(r'^(\d+)', part)
+    chap = match.group(1) if match else '未分类'
     chapdir = os.path.join(out_dir, f'第{chap}章')
     os.makedirs(chapdir, exist_ok=True)
     safe = re.sub(r'[\\/:*?"<>| ]+', '_', part).strip('_')
     pdf_path = os.path.join(chapdir, f'P{pnum:02d}_{safe}.pdf')
-    imgs = sorted(glob.glob(os.path.join(pages_dir, '*.png')))
-    with open(pdf_path, 'wb') as f:
-        f.write(img2pdf.convert(imgs))
+    imgs = sorted(glob.glob(os.path.join(pages_dir, '*.png')),
+                  key=lambda path: (0, int(os.path.splitext(os.path.basename(path))[0]))
+                  if os.path.splitext(os.path.basename(path))[0].isdigit() else (1, path))
+    if not imgs:
+        raise RuntimeError('没有页面，拒绝生成空 PDF')
+    fd, temporary = tempfile.mkstemp(suffix='.pdf', dir=chapdir)
+    try:
+        with os.fdopen(fd, 'wb') as f:
+            img2pdf.convert(imgs, outputstream=f)
+        import fitz
+        with fitz.open(temporary) as doc:
+            if doc.page_count != len(imgs):
+                raise RuntimeError('PDF 页数校验失败')
+        os.replace(temporary, pdf_path)
+    finally:
+        if os.path.exists(temporary):
+            os.remove(temporary)
     return pdf_path, len(imgs)
 
 
 def process_page(bvid, page, part, work_dir, out_dir, ocr=None, cookies=None,
-                 force=False):
+                 force=False, mode='conservative', sample_fps=SAMPLE_FPS, min_run_s=0.5,
+                 video_path=None):
     """处理单个分P（断点续跑：已有完成标记且未 force 则跳过）"""
     pnum = page
     pages_dir = os.path.join(work_dir, 'pages', f'{pnum:03d}')
     done_mark = os.path.join(work_dir, 'pages', f'{pnum:03d}.done.json')
-    video = os.path.join(work_dir, 'video', f'{pnum:03d}.mp4')
+    video = video_path or os.path.join(work_dir, 'video', f'{pnum:03d}.mp4')
+    if mode not in ('conservative', 'compact'):
+        raise ValueError('未知提取模式')
+    os.makedirs(os.path.dirname(pages_dir), exist_ok=True)
+    config = {'bvid': bvid, 'part': part, 'out': os.path.abspath(out_dir),
+              'mode': mode, 'sample_fps': sample_fps, 'min_run_s': min_run_s, 'version': 2}
+    if os.path.exists(video):
+        stat = os.stat(video)
+        config['source'] = [stat.st_size, stat.st_mtime_ns]
     if os.path.exists(done_mark) and not force:
-        log(work_dir, pnum, '已完成，跳过')
-        return json.load(open(done_mark, encoding='utf-8'))
+        try:
+            import fitz
+            with open(done_mark, encoding='utf-8') as f:
+                done = json.load(f)
+            if done.get('config') == config:
+                with fitz.open(done['pdf']) as doc:
+                    if doc.page_count == done['pages'] and doc.page_count > 0:
+                        log(work_dir, pnum, '已完成且校验通过，跳过')
+                        return done
+        except (OSError, ValueError, KeyError, RuntimeError, TypeError, AttributeError):
+            pass
     if not os.path.exists(video):
         log(work_dir, pnum, '视频不存在')
         return None
@@ -272,20 +350,24 @@ def process_page(bvid, page, part, work_dir, out_dir, ocr=None, cookies=None,
     try:
         os.makedirs(lock, exist_ok=False)
     except FileExistsError:
-        if time.time() - os.path.getmtime(lock) < 4500:
-            log(work_dir, pnum, '被其他进程锁定，跳过')
-            return None
-        os.rmdir(lock); os.makedirs(lock, exist_ok=False)
+        raise RuntimeError(f'分P正在处理或上次异常退出，请确认进程已停止后移除锁: {lock}')
     try:
-        if ocr is None:
-            from rapidocr_onnxruntime import RapidOCR
-            ocr = RapidOCR()
-        metas, bad = extract_pages(video, work_dir, pnum, ocr=ocr, pages_dir=pages_dir)
-        pdf_path, n = build_pdf(pnum, part, pages_dir, out_dir, work_dir)
+        if os.path.exists(done_mark):
+            os.replace(done_mark, done_mark + '.previous')
+        with tempfile.TemporaryDirectory(prefix=f'{pnum:03d}-', dir=os.path.dirname(pages_dir)) as staging:
+            metas, bad = extract_pages(video, work_dir, pnum, ocr=ocr, pages_dir=staging,
+                                       mode=mode, sample_fps=sample_fps, min_run_s=min_run_s)
+            pdf_path, n = build_pdf(pnum, part, staging, out_dir, work_dir)
+            os.makedirs(pages_dir, exist_ok=True)
+            for old in glob.glob(os.path.join(pages_dir, '*.png')):
+                os.remove(old)
+            for fresh in glob.glob(os.path.join(staging, '*.png')):
+                shutil.copy2(fresh, pages_dir)
         done = {'page': pnum, 'part': part, 'pdf': pdf_path, 'pages': n,
-                'bad_imgs': bad, 'meta': metas}
-        with open(done_mark, 'w', encoding='utf-8') as f:
+                'bad_imgs': bad, 'meta': metas, 'config': config}
+        with open(done_mark + '.tmp', 'w', encoding='utf-8') as f:
             json.dump(done, f, ensure_ascii=False, indent=1)
+        os.replace(done_mark + '.tmp', done_mark)
         log(work_dir, pnum, f'完成 -> {pdf_path} ({n}页)')
         return done
     finally:

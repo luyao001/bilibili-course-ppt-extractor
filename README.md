@@ -1,5 +1,6 @@
 # bilibili-course-ppt-extractor
 
+> Updated implementation and usage: [RELIABILITY.md](RELIABILITY.md).
 从 B 站课程/讲座视频中自动提取 PPT 课件页面，按讲次生成 PDF，按章节归档。
 
 适用场景：老师上课录屏但不出课件、网课视频只有录播没有讲义 —— 把视频里的 PPT 自动"还原"成可翻阅的 PDF。

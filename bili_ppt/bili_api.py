@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """B站API封装：获取视频分P列表、下载指定分P"""
-import subprocess, sys, json, re, urllib.request, time
+import subprocess, sys, json, re, urllib.request, time, os, tempfile
 
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36")
@@ -24,19 +24,29 @@ def get_pages(bvid: str) -> list:
 def download_page(bvid: str, page: int, out_path: str, cookies: str = None,
                   max_height: int = 480, retries: int = 3) -> bool:
     """下载单个分P的视频流（默认未登录最高480P）"""
-    cmd = [sys.executable, "-m", "yt_dlp", "--no-overwrites",
+    os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
+    cmd = [sys.executable, "-m", "yt_dlp", "--no-playlist",
            "--retries", str(retries), "--socket-timeout", "30",
            "--sleep-requests", "1.2", "--proxy", "",
            "-f", f"bv*[vcodec^=avc1]/bv*/b", "-S", f"res:{max_height}",
-           "-o", out_path, "--no-progress",
+           "--no-progress",
            f"https://www.bilibili.com/video/{bvid}?p={page}"]
     if cookies:
         cmd += ["--cookies", cookies]
-    for attempt in range(retries):
-        r = subprocess.run(cmd, capture_output=True, text=True)
-        if r.returncode == 0 and "ERROR" not in (r.stderr or "")[-400:]:
-            return True
-        time.sleep(8 + attempt * 10)
+    with tempfile.TemporaryDirectory(prefix='bili-download-', dir=os.path.dirname(os.path.abspath(out_path))) as staging:
+        temporary = os.path.join(staging, 'video.mp4')
+        for attempt in range(retries):
+            r = subprocess.run(cmd + ['-o', temporary], capture_output=True, text=True)
+            if r.returncode == 0 and os.path.isfile(temporary):
+                import cv2
+                cap = cv2.VideoCapture(temporary)
+                ok, frame = cap.read()
+                cap.release()
+                if ok and frame is not None:
+                    os.replace(temporary, out_path)
+                    return True
+            if attempt + 1 < retries:
+                time.sleep(8 + attempt * 10)
     return False
 
 
