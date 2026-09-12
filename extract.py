@@ -14,15 +14,19 @@ from bili_ppt import bili_api, extractor, audit
 
 
 def parse_pages(spec, total):
-    if not spec or spec == 'all':
+    if spec is None or spec == 'all':
         return list(range(1, total + 1))
     pages = []
     for piece in spec.split(','):
-        if '-' in piece:
-            a, b = piece.split('-')
-            pages.extend(range(int(a), int(b) + 1))
-        else:
-            pages.append(int(piece))
+        import re
+        match = re.fullmatch(r'\s*(\d+)\s*(?:-\s*(\d+)\s*)?', piece)
+        if not match:
+            raise ValueError('分P格式必须是 all、4、1-10 或 1,3,5')
+        first = int(match.group(1))
+        last = int(match.group(2) or first)
+        if not 1 <= first <= last <= total:
+            raise ValueError(f'分P必须在 1-{total} 范围内，且区间不能倒序')
+        pages.extend(range(first, last + 1))
     if not pages or any(p < 1 or p > total for p in pages):
         raise ValueError(f'分P必须在 1-{total} 范围内，且区间不能倒序')
     return sorted(set(pages))

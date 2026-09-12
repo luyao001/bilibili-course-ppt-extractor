@@ -172,7 +172,6 @@ def get_face():
 def extract_pages(video, work_dir, pnum=1, ocr=None, pages_dir=None,
                   mode='conservative', sample_fps=SAMPLE_FPS, min_run_s=0.5):
     """主流程：返回 metas（页面元信息列表）并把页面PNG写入 pages_dir"""
-    import img2pdf
     cv2.setNumThreads(4)
     if ocr is None:
         if mode == 'compact':

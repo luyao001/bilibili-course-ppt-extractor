@@ -11,9 +11,16 @@ import fitz
 import numpy as np
 
 from bili_ppt import extractor, audit
+from extract import parse_pages
 
 
 class ReliabilityTests(unittest.TestCase):
+    def test_page_ranges_reject_invalid_or_reversed_pieces_before_expanding(self):
+        for spec in ['', '1-3-5', 'abc', '1,5-3', '0', '1-999999999', '1,']:
+            with self.subTest(spec=spec), self.assertRaises(ValueError):
+                parse_pages(spec, 10)
+        self.assertEqual(parse_pages(' 1-3, 2, 5 ', 10), [1, 2, 3, 5])
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)
