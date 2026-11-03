@@ -18,6 +18,24 @@ try:
 except ImportError:
     FFMPEG = "ffmpeg"
 
+
+def make_ocr():
+    """创建多进程友好的 RapidOCR：
+    - det 输入限宽 960/max：默认 limit_type=min 会把小图强制放大到短边736，
+      配合管道内 1.2~2 倍预放大，det 输入可达 2000~4600 像素宽，单次调用慢 50 倍以上；
+    - 每会话限 2 线程：多进程并行时避免线程踩踏（实测该机器 2 进程聚合吞吐最高）。
+    """
+    import rapidocr_onnxruntime.utils as _ru
+    from onnxruntime import SessionOptions as _SO
+    if getattr(_ru.SessionOptions, '__name__', '') != '_limited_session_options':
+        def _limited_session_options():
+            opts = _SO()
+            opts.intra_op_num_threads = 2
+            return opts
+        _ru.SessionOptions = _limited_session_options
+    from rapidocr_onnxruntime import RapidOCR
+    return RapidOCR(det_model_path='', det_limit_side_len=960, det_limit_type='max')
+
 SAMPLE_FPS = 2.0    # 分析帧采样率（每秒2帧）
 MIN_RUN_S = 1.5     # 页面至少稳定显示的秒数（过滤翻页动画过渡）
 MERGE_THR = 1.2     # 相邻段合并阈值（64x36 灰度均值差）
@@ -118,7 +136,7 @@ def segment(frames, thr=1.6, sample_fps=SAMPLE_FPS, min_run_s=0.5, conservative=
 
     def is_cut(a, b):
         bd = np.abs(a - b).reshape(4, 9, 8, 8).mean(axis=(1, 3))
-        cand = bd[blk_static] if blk_static.any() else bd.flat
+        cand = bd[blk_static] if blk_static.any() else bd.reshape(-1)
         top2 = np.sort(cand.flat)[-2:]
         return bool((top2 > 8).all() or cand.max() > 15)
 
@@ -175,8 +193,7 @@ def extract_pages(video, work_dir, pnum=1, ocr=None, pages_dir=None,
     cv2.setNumThreads(4)
     if ocr is None:
         if mode == 'compact':
-            from rapidocr_onnxruntime import RapidOCR
-            ocr = RapidOCR()
+            ocr = make_ocr()
         else:
             ocr = lambda image: (None, None)
     pages_dir = pages_dir or os.path.join(work_dir, 'pages', f'{pnum:03d}')
@@ -205,6 +222,7 @@ def extract_pages(video, work_dir, pnum=1, ocr=None, pages_dir=None,
             mid = ocr_text(ocr, img, 0.0, 1.0, 0.15, 0.75, scale=1.2)
             full = mid if len(mid) >= 10 else ocr_text(ocr, img, 0.0, 1.0, 0.0, 1.0, scale=1.2)
             g = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+            emap = cv2.Canny(g, 60, 160) > 0
             faces = get_face().detectMultiScale(g, scaleFactor=1.1, minNeighbors=5, minSize=(36, 36))
             fx = faces[:, [0, 2]] * (128.0 / img.shape[1]) if len(faces) else None
             candidate_path = os.path.join(candidate_dir, f'{fi:06d}.png')
@@ -213,7 +231,7 @@ def extract_pages(video, work_dir, pnum=1, ocr=None, pages_dir=None,
                 raise RuntimeError('候选图片写入失败')
             cands.append({'t': t, 'image_path': candidate_path, 'title': title, 'mid_len': len(mid),
                           'full_len': len(full), 'top_white': top_white,
-                          'edge': edge_density(img),
+                          'edge': float(emap.mean()), 'edge_map': emap,
                           'darkish': float((g < DARK_THR).mean()),
                           'face_x': (int(fx[:, 0].min()), int((fx[:, 0] + fx[:, 1]).max()))
                                     if fx is not None else None,
@@ -237,13 +255,27 @@ def extract_pages(video, work_dir, pnum=1, ocr=None, pages_dir=None,
         sm &= ~template128
         centers = [(box[0] + box[1]) / 2 for box in
                    (c['face_x'] for c in content if c.get('face_x'))]
+        teacher_band = None
         if len(centers) >= 3:
             import statistics
             cc = int(statistics.median(centers))
             cx0, cx1 = max(0, cc - 45), min(128, cc + 45)
             if cx1 - cx0 < 128 * 0.6:
                 sm[:, cx0:cx1] = False
+                teacher_band = (cx0, cx1)
                 log(work_dir, pnum, f'讲师列带排除 {cx0}-{cx1}')
+
+        # 内容区边缘密度：在整帧Canny边缘上屏蔽讲师列带，
+        # 使"信息最全"的判定不被教师姿态变化干扰
+        valid_cols = None
+        if cands and teacher_band:
+            W = cands[0]['edge_map'].shape[1]
+            valid_cols = np.ones(W, bool)
+            valid_cols[int(teacher_band[0] * W / 128):int(teacher_band[1] * W / 128)] = False
+
+        def content_edge(c):
+            em = c['edge_map']
+            return float(em[:, valid_cols].mean()) if valid_cols is not None else float(em.mean())
 
         def vanish(a, b):
             darkA = (a['gray'] < DARK_THR) & sm
@@ -255,7 +287,7 @@ def extract_pages(video, work_dir, pnum=1, ocr=None, pages_dir=None,
             bb = (b['gray'] < DARK_THR).reshape(4, 18, 8, 16).mean(axis=(1, 3)) > 0.04
             return float((ba == bb).mean())
 
-        # 组内峰值保留：vanish低+版面相似 => 同页递进序列，保留信息最全一帧
+        # 组内峰值保留：vanish低+版面相似 => 同页递进序列
         groups = []
         for c in content:
             if groups:
@@ -264,7 +296,31 @@ def extract_pages(video, work_dir, pnum=1, ocr=None, pages_dir=None,
                     groups[-1]['items'].append(c)
                     continue
             groups.append({'items': [c]})
-        kept = [max(g['items'], key=lambda x: x['edge']) for g in groups]
+        # 保留内容区信息最全一帧（同分取更晚的帧）
+        kept = []
+        for g in groups:
+            _bi, _bc = max(enumerate(g['items']), key=lambda ic: (content_edge(ic[1]), ic[0]))
+            kept.append(_bc)
+
+        # 跨组最终态归并：翻页切分可能把同一页的逐步展示切碎成多组，
+        # 若相邻保留页满足"旧内容保留(vanish低) + 新增少(new_ratio低) + 版面相似"，
+        # 判定为同一页的递进，只保留更完整的一帧——避免半成品页充数
+        if mode == 'compact':
+            final = []
+            for c in kept:
+                if final:
+                    p = final[-1]
+                    dp, dc = (p['gray'] < DARK_THR) & sm, (c['gray'] < DARK_THR) & sm
+                    vanish_pc = float((dp & ~dc).sum()) / max(int(dp.sum()), 1)
+                    new_ratio = float((dc & ~dp).sum()) / max(int(dc.sum()), 1)
+                    if vanish_pc < 0.15 and new_ratio < 0.35 and layout_sim(p, c) > 0.75:
+                        if (content_edge(c), 1) >= (content_edge(p), 0):
+                            final[-1] = c
+                        continue
+                final.append(c)
+            if len(final) < len(kept):
+                log(work_dir, pnum, f'跨组归并 {len(kept)} -> {len(final)}')
+            kept = final
         log(work_dir, pnum, f'候选{len(cands)} -> 内容页{len(content)} -> 页面{len(kept)}')
 
         metas, bad = [], 0

@@ -59,7 +59,8 @@ def main():
     ap.add_argument('--force', action='store_true', help='强制重跑已完成的分P')
     ap.add_argument('--mode', choices=['conservative', 'compact'], default='conservative', help='默认保留稳定内容页；compact 合并动画并过滤内容')
     ap.add_argument('--sample-fps', type=float, default=2.0)
-    ap.add_argument('--min-run-s', type=float, default=0.5)
+    ap.add_argument('--min-run-s', type=float, default=1.0,
+                    help='页面至少稳定显示的秒数（默认1.0，过滤翻页过渡半帧）')
     args = ap.parse_args()
     import math, re
     if args.video:
@@ -95,8 +96,7 @@ def main():
     if args.workers <= 1:
         ocr = None
         if args.mode == 'compact':
-            from rapidocr_onnxruntime import RapidOCR
-            ocr = RapidOCR()
+            ocr = extractor.make_ocr()
         for page in targets:
             part = pages_info[page - 1]['part']
             try:
